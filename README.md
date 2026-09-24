@@ -54,7 +54,13 @@ gh-enterprise-repos --hostname ghe.example.com -e acme-inc
 | `--max-retries <N>` | Retries per request (default 5) |
 | `--batch-size <N>` | Items per cursor fetch (default 100, max 100) |
 
-The token is read from `GITHUB_TOKEN`, falling back to `GH_TOKEN`.
+The token is read from `GITHUB_TOKEN`, falling back to `GH_TOKEN`, and then to
+`gh auth token` if the `gh` CLI is logged in. The CLI's credential is worth
+preferring: it carries the SSO authorizations and organization grants that a
+hand-made PAT has to be given one organization at a time, and an enterprise
+listing made with a token that cannot see an organization leaves that
+organization out without an error. The startup line names which of the three
+the run used.
 
 ## Output
 
