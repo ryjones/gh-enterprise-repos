@@ -111,14 +111,7 @@ async fn run() -> Result<()> {
         }
     }
 
-    let token = std::env::var("GITHUB_TOKEN")
-        .or_else(|_| std::env::var("GH_TOKEN"))
-        .map_err(|_| {
-            anyhow::anyhow!("set GITHUB_TOKEN (or GH_TOKEN) to a token with read:enterprise")
-        })?;
-    if token.trim().is_empty() {
-        bail!("GITHUB_TOKEN is set but empty");
-    }
+    let (token, token_from) = resolve_token(args.hostname.as_deref())?;
 
     let api_url = match (&args.api_url, &args.hostname) {
         (Some(url), _) => url.clone(),
@@ -133,11 +126,11 @@ async fn run() -> Result<()> {
         (None, None) => "https://api.github.com/graphql".to_string(),
     };
 
-    let client = GithubClient::new(&api_url, token.trim(), args.max_retries)?;
+    let client = GithubClient::new(&api_url, &token, args.max_retries)?;
     let collector = Collector::new(&client, args.filter(), args.topics, args.batch_size);
 
     let viewer = collector.viewer_login().await?;
-    eprintln!("Authenticated as {viewer} at {api_url}");
+    eprintln!("Authenticated as {viewer} at {api_url} (token from {token_from})");
 
     let writing_to_stdout = args.output.as_deref() == Some(Path::new("-"));
     if args.output.is_none() {
@@ -330,6 +323,54 @@ fn text(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// Find a token: the environment first, then whatever `gh` is logged in as.
+///
+/// The environment wins because it is the explicit choice, but the CLI's own
+/// credential is worth falling back to: it already carries the SSO
+/// authorizations and organization grants that a hand-made PAT is given one at
+/// a time, and an enterprise listing made with a token that cannot see an
+/// organization leaves it out without saying so.
+fn resolve_token(hostname: Option<&str>) -> Result<(String, String)> {
+    for name in ["GITHUB_TOKEN", "GH_TOKEN"] {
+        match std::env::var(name) {
+            Ok(value) if !value.trim().is_empty() => {
+                return Ok((value.trim().to_string(), name.to_string()));
+            }
+            Ok(_) => bail!("{name} is set but empty"),
+            Err(_) => {}
+        }
+    }
+
+    let mut command = std::process::Command::new("gh");
+    command.arg("auth").arg("token");
+    if let Some(host) = hostname {
+        let host = host
+            .trim_end_matches('/')
+            .trim_start_matches("https://")
+            .trim_start_matches("http://");
+        command.arg("--hostname").arg(host);
+    }
+    let output = command.output().map_err(|err| {
+        anyhow::anyhow!(
+            "set GITHUB_TOKEN (or GH_TOKEN) to a token with read:enterprise, \
+             or log in with `gh auth login` (could not run gh: {err})"
+        )
+    })?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!(
+            "set GITHUB_TOKEN (or GH_TOKEN) to a token with read:enterprise, or log in \
+             with `gh auth login` (gh auth token failed: {})",
+            stderr.trim()
+        );
+    }
+    let token = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if token.is_empty() {
+        bail!("`gh auth token` returned nothing; run `gh auth login`");
+    }
+    Ok((token, "gh auth token".to_string()))
 }
 
 #[cfg(test)]
