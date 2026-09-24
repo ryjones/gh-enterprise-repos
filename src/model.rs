@@ -132,6 +132,11 @@ pub struct Report {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub organizations_without_repository_data: Vec<String>,
     pub totals: Totals,
+    /// Anything about the run a later reader should weigh before trusting the
+    /// numbers — at present, organizations that came back empty from a run
+    /// that filtered nothing out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
     /// Repositories, ordered by org login then repository name (both
     /// case-insensitive, ascending).
     pub repositories: Vec<Repository>,
@@ -140,6 +145,14 @@ pub struct Report {
 #[derive(Debug, Serialize)]
 pub struct Source {
     pub api_url: String,
+    /// The account the token authenticated as. A listing covers only the
+    /// organizations that account can see, so this says whose view it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub authenticated_as: Option<String>,
+    /// Scopes GitHub reported for the token (`x-oauth-scopes`). Absent for
+    /// fine-grained PATs and App tokens, which do not carry them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token_scopes: Option<String>,
     pub enterprise: String,
     /// The filters the run applied, echoed so a file explains itself.
     pub filters: Filters,
@@ -159,6 +172,10 @@ pub struct Filters {
 pub struct Totals {
     pub organizations: usize,
     pub repositories: usize,
+    /// Organizations that were read successfully and held no repository the
+    /// filters kept. Under an unfiltered run this is the shape an organization
+    /// takes when the token cannot see into it.
+    pub organizations_without_repositories: usize,
 }
 
 #[derive(Debug, Serialize)]

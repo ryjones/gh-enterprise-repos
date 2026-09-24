@@ -67,6 +67,8 @@ the run used.
 ```yaml
 source:
   api_url: https://api.github.com/graphql
+  authenticated_as: alice
+  token_scopes: read:org, repo
   enterprise: acme-inc
   filters:
     visibility: public
@@ -79,6 +81,7 @@ organizations:
 totals:
   organizations: 3
   repositories: 42
+  organizations_without_repositories: 0
 repositories:
   - org: acme-labs
     name: widget-kit
@@ -112,6 +115,36 @@ Organizations with no matching repositories still appear under
 `organizations:`. An organization that could not be read at all is listed there
 too, plus under `organizations_without_repository_data`, so a permissions gap
 does not read as an empty org.
+
+## Whose view a listing is
+
+An organization the token cannot see is not an error. `enterprise.organizations`
+simply does not return it, the listing covers the organizations that came back,
+and nothing in the file says one is missing. An organization it can see but
+cannot see *into* is worse: that one answers with an empty repository list, so
+it appears in `organizations` holding nothing at all.
+
+`authenticated_as` and `token_scopes` record whose view produced the file —
+`token_scopes` is absent for fine-grained PATs and App tokens, which do not
+report scopes. `totals.organizations_without_repositories` counts the
+organizations that answered and held nothing the filters kept.
+
+Under a filter that count is unremarkable: most organizations have no internal
+repositories. When a run filters *nothing* out — `--visibility all --archived
+include --forks include` — and at least three organizations, and at least 10% of
+them, still come back empty, the run prints a warning and records it under
+`notes`:
+
+```yaml
+notes:
+  - "organizations_without_repositories: 6 of 54 organizations (11.1%) held no
+    repository, although this run filtered none out. An organization the token
+    cannot see into answers with an empty list rather than an error, so check
+    these against the enterprise before reading them as empty."
+```
+
+`gh auth token` is usually the credential that reaches everything, since it
+carries the SSO authorizations a PAT has to be granted per organization.
 
 ## Behavior worth knowing
 

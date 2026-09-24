@@ -3,3 +3,6 @@
 
 # Captured API output from real runs; kept locally, not tracked.
 /results
+
+# Report output naming real repositories; kept locally, not tracked.
+/reports

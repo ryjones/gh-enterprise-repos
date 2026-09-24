@@ -3,6 +3,7 @@ mod collect;
 mod model;
 mod yaml;
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -141,7 +142,12 @@ async fn run() -> Result<()> {
     let mut failed_enterprises = 0usize;
     for slug in &enterprises {
         match export_enterprise(&args, &collector, &api_url, slug).await {
-            Ok(report) => {
+            Ok(mut report) => {
+                report.source.authenticated_as = Some(viewer.clone());
+                report.source.token_scopes = client.oauth_scopes();
+                for note in &report.notes {
+                    eprintln!("Warning: {note}");
+                }
                 let yaml = yaml::to_string(&report).context("failed to serialize YAML")?;
                 if writing_to_stdout {
                     std::io::stdout().lock().write_all(yaml.as_bytes())?;
@@ -256,20 +262,72 @@ fn build_report(
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
 
+    // An org that answered and held nothing. Under a filtered run that is
+    // ordinary -- most orgs have no internal repositories -- so the count is
+    // recorded always and read as a symptom only when nothing was filtered out.
+    let with_repos: HashSet<String> = repositories
+        .iter()
+        .map(|repo| repo.org.to_lowercase())
+        .collect();
+    let empty_orgs = org_logins
+        .iter()
+        .filter(|org| {
+            !with_repos.contains(&org.to_lowercase())
+                && !failed_orgs.iter().any(|failed| failed == *org)
+        })
+        .count();
+
+    let filters = args.filter().describe();
+    let unfiltered =
+        filters.visibility == "all" && filters.archived == "include" && filters.forks == "include";
+    let notes = visibility_note(empty_orgs, org_logins.len(), unfiltered)
+        .into_iter()
+        .collect();
+
     Report {
         source: Source {
             api_url: api_url.to_string(),
+            authenticated_as: None,
+            token_scopes: None,
             enterprise: enterprise.to_string(),
-            filters: args.filter().describe(),
+            filters,
         },
         totals: Totals {
             organizations: org_logins.len(),
             repositories: repositories.len(),
+            organizations_without_repositories: empty_orgs,
         },
         organizations: org_logins,
         organizations_without_repository_data: failed_orgs,
+        notes,
         repositories,
     }
+}
+
+/// Say so when a run that filtered nothing out still found organizations with
+/// no repositories at all.
+///
+/// A token that cannot see into an organization is told it has no repositories
+/// rather than being refused, so an unfiltered run that comes back empty for
+/// several organizations is more likely short of access than short of code.
+/// Under any filter the same emptiness is unremarkable, so nothing is claimed.
+fn visibility_note(empty_orgs: usize, orgs: usize, unfiltered: bool) -> Option<String> {
+    const MIN_ORGS: usize = 3;
+    const MIN_PERCENT: f64 = 10.0;
+
+    if !unfiltered || orgs == 0 || empty_orgs < MIN_ORGS {
+        return None;
+    }
+    let percent = empty_orgs as f64 * 100.0 / orgs as f64;
+    if percent < MIN_PERCENT {
+        return None;
+    }
+    Some(format!(
+        "organizations_without_repositories: {empty_orgs} of {orgs} organizations ({percent:.1}%) \
+         held no repository, although this run filtered none out. An organization the token \
+         cannot see into answers with an empty list rather than an error, so check these \
+         against the enterprise before reading them as empty."
+    ))
 }
 
 fn repository(org: &str, repo: RepoNode) -> Repository {
@@ -376,6 +434,26 @@ fn resolve_token(hostname: Option<&str>) -> Result<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_empty_org_under_a_filter_says_nothing() {
+        // Most orgs hold no internal repositories; that is not a symptom.
+        assert_eq!(visibility_note(20, 54, false), None);
+    }
+
+    #[test]
+    fn empty_orgs_in_an_unfiltered_run_are_noted() {
+        assert_eq!(visibility_note(0, 54, true), None);
+        // Two of fifty-four is ordinary; the floor keeps it quiet.
+        assert_eq!(visibility_note(2, 54, true), None);
+        // Under the percentage bar, though over the count floor.
+        assert_eq!(visibility_note(3, 54, true), None);
+        let note = visibility_note(6, 54, true).expect("6 of 54 should be noted");
+        assert!(
+            note.starts_with("organizations_without_repositories: 6 of 54 organizations (11.1%)")
+        );
+        assert!(note.contains("cannot see into"));
+    }
 
     fn args(extra: &[&str]) -> Args {
         let mut argv = vec!["gh-enterprise-repos", "--enterprise", "example"];
