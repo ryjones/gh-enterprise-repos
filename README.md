@@ -156,6 +156,32 @@ Organizations with no matching repositories still appear under
 too, plus under `organizations_without_repository_data`, so a permissions gap
 does not read as an empty org.
 
+## Drift against a CLOWarden config
+
+`drift.zsh` compares an organization's export with the
+[CLOWarden](https://github.com/cncf/clowarden) `config.yaml` meant to describe
+it and writes what differs to `DRIFT.md` beside the export. It needs `yq` and
+`jq`, reads the two files, and never talks to GitHub.
+
+```sh
+gh-enterprise-repos --org acme-labs --visibility all --archived include --teams -d results
+./drift.zsh -c ../acme-labs/governance/config.yaml      # → results/DRIFT.md
+```
+
+The report opens with the counts, then lists: active repositories the config
+does not manage, private and internal repositories, archived repositories,
+active repositories no team reaches, managed repositories whose visibility or
+team permissions differ from the config, repositories the config names that
+GitHub does not have, and teams on one side but not the other. The export has to
+be made with `--teams`; one made under a filter is accepted, and the report says
+its counts are partial.
+
+| Flag | Meaning |
+| --- | --- |
+| `-c CONFIG` | The CLOWarden config to compare against, or set `CLOWARDEN_CONFIG` |
+| `-o OUT` | Report to write (default `DRIFT.md` beside the export) |
+| `EXPORT` | The export to read (default: the only `.yaml` in `results/`) |
+
 ## Whose view a listing is
 
 An organization the token cannot see is not an error. `enterprise.organizations`
