@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,61 @@ pub struct RepositoryTopic {
     pub topic: Option<NamedNode>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct OrgTeamsData {
+    pub organization: Option<OrgTeamsNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OrgTeamsNode {
+    pub teams: TeamConnection,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamConnection {
+    #[serde(rename = "pageInfo")]
+    pub page_info: PageInfo,
+    #[serde(default)]
+    pub nodes: Vec<Option<TeamNode>>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamNode {
+    pub slug: String,
+    pub repositories: TeamRepoConnection,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamRepoConnection {
+    #[serde(rename = "pageInfo")]
+    pub page_info: PageInfo,
+    #[serde(default)]
+    pub edges: Vec<Option<TeamRepoEdge>>,
+}
+
+/// One repository a team reaches, and how: `ADMIN`, `MAINTAIN`, `WRITE`,
+/// `TRIAGE` or `READ`.
+#[derive(Debug, Deserialize)]
+pub struct TeamRepoEdge {
+    pub permission: Option<String>,
+    pub node: Option<NamedNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamReposData {
+    pub organization: Option<TeamReposOrgNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamReposOrgNode {
+    pub team: Option<TeamReposNode>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TeamReposNode {
+    pub repositories: TeamRepoConnection,
+}
+
 // ---------------------------------------------------------------------------
 // YAML output shapes
 // ---------------------------------------------------------------------------
@@ -153,7 +210,13 @@ pub struct Source {
     /// fine-grained PATs and App tokens, which do not carry them.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token_scopes: Option<String>,
-    pub enterprise: String,
+    /// The enterprise the run walked; absent when it was pointed at a single
+    /// organization instead.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enterprise: Option<String>,
+    /// The organization the run was pointed at with `--org`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub organization: Option<String>,
     /// The filters the run applied, echoed so a file explains itself.
     pub filters: Filters,
 }
@@ -176,6 +239,10 @@ pub struct Totals {
     /// filters kept. Under an unfiltered run this is the shape an organization
     /// takes when the token cannot see into it.
     pub organizations_without_repositories: usize,
+    /// Listed repositories no team has access to. Only present with `--teams`,
+    /// so an absent `teams` key can be told apart from teams never fetched.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repositories_without_teams: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +278,10 @@ pub struct Repository {
     /// Ascending; absent without `--topics`, or when the repo has none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub topics: Vec<String>,
+    /// Team slug -> permission, in slug order; absent without `--teams`, or
+    /// when no team has access.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub teams: BTreeMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

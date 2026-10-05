@@ -2,7 +2,8 @@
 
 Queries a GitHub enterprise over GraphQL and writes one YAML file per
 enterprise listing every repository in every organization it contains. Public,
-non-archived repositories by default.
+non-archived repositories by default. `--org` does the same for a single
+organization without going through its enterprise.
 
 Sibling of [`gh-org-members`](../all-users-enterprise), which exports the
 people instead.
@@ -33,6 +34,13 @@ gh-enterprise-repos -e acme-inc -o - | yq '.repositories[].full_name'
 # everything, including private, internal and archived repositories
 gh-enterprise-repos -e acme-inc --visibility all --archived include
 
+# one organization → ./acme-labs.yaml, with the teams that reach each repository
+gh-enterprise-repos --org acme-labs --teams
+
+# repositories no team has access to
+gh-enterprise-repos --org acme-labs --visibility all --archived include --teams -o - \
+  | yq '.repositories[] | select(.teams == null) | .full_name'
+
 # GitHub Enterprise Server
 gh-enterprise-repos --hostname ghe.example.com -e acme-inc
 ```
@@ -42,12 +50,14 @@ gh-enterprise-repos --hostname ghe.example.com -e acme-inc
 | Flag | Meaning |
 | --- | --- |
 | `-e, --enterprise <SLUG>` | Enterprise slug; repeatable, one YAML file each |
-| `-d, --output-dir <DIR>` | Where `<enterprise>.yaml` is written (default `.`) |
-| `-o, --output <FILE>` | Write one enterprise to this file instead; `-` is stdout |
+| `--org <LOGIN>` | Organization login, instead of or alongside `-e`; repeatable, one YAML file each |
+| `-d, --output-dir <DIR>` | Where `<enterprise>.yaml` or `<org>.yaml` is written (default `.`) |
+| `-o, --output <FILE>` | Write one export to this file instead; `-` is stdout |
 | `--visibility <V>` | `public` (default), `private`, `internal`, `all` |
 | `--archived <A>` | `exclude` (default), `include`, `only` |
 | `--forks <F>` | `include` (default), `exclude`, `only` |
 | `--topics` | Include topics, which cost a nested lookup per repository |
+| `--teams` | Include the teams with access to each repository, which costs a walk of every team |
 | `--hostname <HOST>` | GitHub Enterprise Server host, e.g. `ghe.example.com` |
 | `--api-url <URL>` | Full GraphQL endpoint, if it is not `https://<host>/api/graphql` |
 | `--concurrency <N>` | Organizations queried at once (default 3, max 16) |
@@ -110,6 +120,36 @@ case-insensitive). `template` and `empty` appear only when true; a field the
 token could not read, or that the repository does not have, is absent rather
 than null. `topics` is only fetched with `--topics`, and is then sorted by name. `license` is the SPDX id, falling back to the
 license name when GitHub reports `NOASSERTION`.
+
+With `--org` the file is the same shape, except that `source` names an
+`organization` instead of an `enterprise` and `organizations` holds that one
+login.
+
+## Teams
+
+`--teams` adds the teams that have access to each repository and the permission
+each one holds — `admin`, `maintain`, `write`, `triage` or `read` — in slug
+order:
+
+```yaml
+    teams:
+      widget-admins: admin
+      widget-maintainers: maintain
+```
+
+A repository no team reaches has no `teams` key, and
+`totals.repositories_without_teams` counts those. That total is only present
+with `--teams`, which is how a file with no `teams` keys says whether nobody has
+access or nobody asked.
+
+GraphQL has no teams field on a repository, so the run walks every team in the
+organization and inverts each one's repository list; the cost grows with the
+number of teams, not repositories. This is team access only: people added to a
+repository directly, and outside collaborators, are not teams and do not appear.
+Secret teams are visible to their members and to organization owners, so a
+listing made by anyone else can show a repository as teamless when it is not. If
+the teams of an organization cannot be read, that organization fails rather
+than exporting with every repository looking unowned.
 
 Organizations with no matching repositories still appear under
 `organizations:`. An organization that could not be read at all is listed there
@@ -175,7 +215,7 @@ cargo test
 
 Unit tests cover the filter (argument mapping, local re-check, unreadable
 fields), report assembly (ordering, unreadable orgs, topic sorting, license
-fallback, omitted fields) and the backoff/reset arithmetic. They make no
+fallback, omitted fields, team attachment) and the backoff/reset arithmetic. They make no
 network calls.
 
 `results/` is gitignored and holds YAML captured from real runs, kept so the

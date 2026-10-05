@@ -3,7 +3,7 @@ mod collect;
 mod model;
 mod yaml;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -15,20 +15,26 @@ use client::GithubClient;
 use collect::{Archived, Collector, Filter, Forks, OrgSnapshot, Visibility};
 use model::*;
 
-/// Export the repositories of every organization in a GitHub enterprise as
-/// YAML — one file per enterprise, public non-archived repositories by default.
+/// Export the repositories of every organization in a GitHub enterprise — or
+/// of a single organization — as YAML: one file per enterprise or organization,
+/// public non-archived repositories by default.
 #[derive(Debug, Parser)]
 #[command(name = "gh-enterprise-repos", version, about, long_about = None)]
 struct Args {
     /// Enterprise slug. Repeatable; each one gets its own YAML file.
-    #[arg(short, long, value_name = "SLUG", required = true)]
+    #[arg(short, long, value_name = "SLUG", required_unless_present = "org")]
     enterprise: Vec<String>,
 
-    /// Directory to write `<enterprise>.yaml` into.
+    /// Organization login, for one organization without going through its
+    /// enterprise. Repeatable; each one gets its own YAML file.
+    #[arg(long, value_name = "LOGIN")]
+    org: Vec<String>,
+
+    /// Directory to write `<enterprise>.yaml` or `<org>.yaml` into.
     #[arg(short = 'd', long, value_name = "DIR", default_value = ".")]
     output_dir: PathBuf,
 
-    /// Write a single enterprise's YAML here instead, or to stdout with `-`.
+    /// Write a single export's YAML here instead, or to stdout with `-`.
     #[arg(short, long, value_name = "FILE", conflicts_with = "output_dir")]
     output: Option<PathBuf>,
 
@@ -47,6 +53,11 @@ struct Args {
     /// Include repository topics, which cost an extra nested lookup per repo.
     #[arg(long)]
     topics: bool,
+
+    /// Include the teams with access to each repository and their permission,
+    /// which costs a walk of every team in the organization.
+    #[arg(long)]
+    teams: bool,
 
     /// GraphQL endpoint. Defaults to github.com, or to the GitHub Enterprise
     /// Server endpoint derived from --hostname.
@@ -81,6 +92,40 @@ impl Args {
     }
 }
 
+/// What one output file covers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Target {
+    Enterprise(String),
+    Org(String),
+}
+
+impl Target {
+    fn name(&self) -> &str {
+        match self {
+            Target::Enterprise(name) | Target::Org(name) => name,
+        }
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
+            Target::Enterprise(_) => "enterprise",
+            Target::Org(_) => "organization",
+        }
+    }
+}
+
+/// Trim, drop blanks, and sort and de-duplicate case-insensitively.
+fn normalize(names: &[String]) -> Vec<String> {
+    let mut names: Vec<String> = names
+        .iter()
+        .map(|name| name.trim().trim_matches('/').to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_by_key(|name| name.to_lowercase());
+    names.dedup_by_key(|name| name.to_lowercase());
+    names
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(err) = run().await {
@@ -92,23 +137,34 @@ async fn main() {
 async fn run() -> Result<()> {
     let args = Args::parse();
 
-    let mut enterprises: Vec<String> = args
-        .enterprise
-        .iter()
-        .map(|slug| slug.trim().trim_matches('/').to_string())
-        .filter(|slug| !slug.is_empty())
+    let enterprises = normalize(&args.enterprise);
+    let orgs = normalize(&args.org);
+    // Both kinds are written as `<name>.yaml`, so one name cannot be both.
+    if let Some(both) = orgs.iter().find(|org| {
+        enterprises
+            .iter()
+            .any(|slug| slug.eq_ignore_ascii_case(org))
+    }) {
+        bail!(
+            "`{both}` is given as both an enterprise and an organization, which would \
+             write the same file twice; run them separately"
+        );
+    }
+    let targets: Vec<Target> = enterprises
+        .into_iter()
+        .map(Target::Enterprise)
+        .chain(orgs.into_iter().map(Target::Org))
         .collect();
-    enterprises.sort_by_key(|slug| slug.to_lowercase());
-    enterprises.dedup_by_key(|slug| slug.to_lowercase());
-    if enterprises.is_empty() {
-        bail!("pass --enterprise <slug>");
+    if targets.is_empty() {
+        bail!("pass --enterprise <slug> or --org <login>");
     }
-    if args.output.is_some() && enterprises.len() > 1 {
-        bail!("--output writes one file; use --output-dir for several enterprises");
+    if args.output.is_some() && targets.len() > 1 {
+        bail!("--output writes one file; use --output-dir for several exports");
     }
-    for slug in &enterprises {
-        if slug.contains('/') || slug.contains('\\') || slug.starts_with('.') {
-            bail!("`{slug}` is not a usable enterprise slug");
+    for target in &targets {
+        let name = target.name();
+        if name.contains('/') || name.contains('\\') || name.starts_with('.') {
+            bail!("`{name}` is not a usable {} name", target.kind());
         }
     }
 
@@ -128,7 +184,13 @@ async fn run() -> Result<()> {
     };
 
     let client = GithubClient::new(&api_url, &token, args.max_retries)?;
-    let collector = Collector::new(&client, args.filter(), args.topics, args.batch_size);
+    let collector = Collector::new(
+        &client,
+        args.filter(),
+        args.topics,
+        args.teams,
+        args.batch_size,
+    );
 
     let viewer = collector.viewer_login().await?;
     eprintln!("Authenticated as {viewer} at {api_url} (token from {token_from})");
@@ -139,9 +201,10 @@ async fn run() -> Result<()> {
             .with_context(|| format!("failed to create {}", args.output_dir.display()))?;
     }
 
-    let mut failed_enterprises = 0usize;
-    for slug in &enterprises {
-        match export_enterprise(&args, &collector, &api_url, slug).await {
+    let mut failed_targets = 0usize;
+    for target in &targets {
+        let name = target.name();
+        match export_target(&args, &collector, &api_url, target).await {
             Ok(mut report) => {
                 report.source.authenticated_as = Some(viewer.clone());
                 report.source.token_scopes = client.oauth_scopes();
@@ -154,7 +217,7 @@ async fn run() -> Result<()> {
                 } else {
                     let path = match &args.output {
                         Some(path) => path.clone(),
-                        None => args.output_dir.join(format!("{slug}.yaml")),
+                        None => args.output_dir.join(format!("{name}.yaml")),
                     };
                     std::fs::write(&path, &yaml)
                         .with_context(|| format!("failed to write {}", path.display()))?;
@@ -167,8 +230,8 @@ async fn run() -> Result<()> {
                 }
             }
             Err(err) => {
-                failed_enterprises += 1;
-                eprintln!("error: enterprise `{slug}`: {err:#}");
+                failed_targets += 1;
+                eprintln!("error: {} `{name}`: {err:#}", target.kind());
             }
         }
     }
@@ -177,23 +240,39 @@ async fn run() -> Result<()> {
     if let (Some(remaining), Some(limit)) = (rate.remaining, rate.limit) {
         eprintln!("Rate limit: {remaining}/{limit} points remaining");
     }
-    if failed_enterprises == enterprises.len() {
-        bail!("every enterprise failed to export");
+    if failed_targets == targets.len() {
+        bail!("nothing was exported: every enterprise and organization failed");
     }
-    if failed_enterprises > 0 {
-        eprintln!("Warning: {failed_enterprises} enterprise(s) failed");
+    if failed_targets > 0 {
+        eprintln!("Warning: {failed_targets} export(s) failed");
     }
     Ok(())
 }
 
-/// Query one enterprise and assemble its report. One unreadable organization is
-/// recorded and the rest still export; every organization failing is an error.
-async fn export_enterprise(
+/// Query one enterprise or organization and assemble its report.
+async fn export_target(
     args: &Args,
     collector: &Collector<'_>,
     api_url: &str,
-    slug: &str,
+    target: &Target,
 ) -> Result<Report> {
+    let (snapshots, failed) = match target {
+        Target::Enterprise(slug) => enterprise_snapshots(args, collector, slug).await?,
+        Target::Org(login) => {
+            eprintln!("Listing repositories in organization `{login}` …");
+            (vec![collector.org_snapshot(login).await?], Vec::new())
+        }
+    };
+    Ok(build_report(args, api_url, target, snapshots, failed))
+}
+
+/// Read every organization in an enterprise. One unreadable organization is
+/// recorded and the rest still export; every organization failing is an error.
+async fn enterprise_snapshots(
+    args: &Args,
+    collector: &Collector<'_>,
+    slug: &str,
+) -> Result<(Vec<OrgSnapshot>, Vec<String>)> {
     eprintln!("Listing organizations in enterprise `{slug}` …");
     let mut orgs = collector.enterprise_orgs(slug).await?;
     orgs.sort_by_key(|o| o.to_lowercase());
@@ -230,13 +309,13 @@ async fn export_enterprise(
         bail!("every organization in `{slug}` failed to query");
     }
 
-    Ok(build_report(args, api_url, slug, succeeded, failed))
+    Ok((succeeded, failed))
 }
 
 fn build_report(
     args: &Args,
     api_url: &str,
-    enterprise: &str,
+    target: &Target,
     snapshots: Vec<OrgSnapshot>,
     mut failed_orgs: Vec<String>,
 ) -> Report {
@@ -245,8 +324,13 @@ fn build_report(
 
     for snapshot in snapshots {
         org_logins.push(snapshot.login.clone());
+        let mut access = snapshot.teams;
         for repo in snapshot.repositories {
-            repositories.push(repository(&snapshot.login, repo));
+            let teams = access
+                .as_mut()
+                .and_then(|access| access.remove(&repo.name.to_lowercase()))
+                .unwrap_or_default();
+            repositories.push(repository(&snapshot.login, repo, teams));
         }
     }
 
@@ -284,18 +368,28 @@ fn build_report(
         .into_iter()
         .collect();
 
+    let (enterprise, organization) = match target {
+        Target::Enterprise(slug) => (Some(slug.clone()), None),
+        Target::Org(login) => (None, Some(login.clone())),
+    };
+    let without_teams = args
+        .teams
+        .then(|| repositories.iter().filter(|r| r.teams.is_empty()).count());
+
     Report {
         source: Source {
             api_url: api_url.to_string(),
             authenticated_as: None,
             token_scopes: None,
-            enterprise: enterprise.to_string(),
+            enterprise,
+            organization,
             filters,
         },
         totals: Totals {
             organizations: org_logins.len(),
             repositories: repositories.len(),
             organizations_without_repositories: empty_orgs,
+            repositories_without_teams: without_teams,
         },
         organizations: org_logins,
         organizations_without_repository_data: failed_orgs,
@@ -330,7 +424,7 @@ fn visibility_note(empty_orgs: usize, orgs: usize, unfiltered: bool) -> Option<S
     ))
 }
 
-fn repository(org: &str, repo: RepoNode) -> Repository {
+fn repository(org: &str, repo: RepoNode, teams: BTreeMap<String, String>) -> Repository {
     let mut topics: Vec<String> = repo
         .repository_topics
         .map(|connection| {
@@ -370,6 +464,7 @@ fn repository(org: &str, repo: RepoNode) -> Repository {
         stars: repo.stargazer_count,
         forks: repo.fork_count,
         topics,
+        teams,
         created_at: repo.created_at,
         updated_at: repo.updated_at,
         pushed_at: repo.pushed_at,
@@ -495,14 +590,19 @@ mod tests {
         OrgSnapshot {
             login: login.to_string(),
             repositories: repos,
+            teams: None,
         }
+    }
+
+    fn example() -> Target {
+        Target::Enterprise("example".into())
     }
 
     fn report(snapshots: Vec<OrgSnapshot>) -> Report {
         build_report(
             &args(&[]),
             "https://api.github.com/graphql",
-            "example",
+            &example(),
             snapshots,
             Vec::new(),
         )
@@ -537,7 +637,7 @@ mod tests {
         let report = build_report(
             &args(&[]),
             "https://api.github.com/graphql",
-            "example",
+            &example(),
             vec![snapshot("readable", vec![repo_node("one")])],
             vec!["locked-down".into()],
         );
@@ -614,14 +714,79 @@ mod tests {
                 "exclude",
             ]),
             "https://api.github.com/graphql",
-            "example",
+            &example(),
             vec![snapshot("acme", vec![repo_node("one")])],
             Vec::new(),
         );
         assert_eq!(report.source.filters.visibility, "all");
         assert_eq!(report.source.filters.archived, "include");
         assert_eq!(report.source.filters.forks, "exclude");
-        assert_eq!(report.source.enterprise, "example");
+        assert_eq!(report.source.enterprise.as_deref(), Some("example"));
+        assert_eq!(report.source.organization, None);
+    }
+
+    #[test]
+    fn an_organization_can_stand_in_for_an_enterprise() {
+        let args = Args::parse_from(["gh-enterprise-repos", "--org", "acme"]);
+        assert!(args.enterprise.is_empty());
+        let report = build_report(
+            &args,
+            "https://api.github.com/graphql",
+            &Target::Org("acme".into()),
+            vec![snapshot("acme", vec![repo_node("one")])],
+            Vec::new(),
+        );
+        assert_eq!(report.source.organization.as_deref(), Some("acme"));
+        assert_eq!(report.source.enterprise, None);
+        assert_eq!(report.organizations, ["acme"]);
+
+        assert!(Args::try_parse_from(["gh-enterprise-repos"]).is_err());
+    }
+
+    #[test]
+    fn names_are_trimmed_sorted_and_deduplicated() {
+        let names = ["beta/", " Alpha ", "ALPHA", "", "beta"].map(String::from);
+        assert_eq!(normalize(&names), ["Alpha", "beta"]);
+    }
+
+    #[test]
+    fn teams_are_attached_by_repository_name_and_the_gaps_counted() {
+        let mut with_teams = snapshot("acme", vec![repo_node("One"), repo_node("two")]);
+        with_teams.teams = Some(
+            [(
+                "one".to_string(),
+                [
+                    ("maintainers".to_string(), "maintain".to_string()),
+                    ("admins".to_string(), "admin".to_string()),
+                ]
+                .into(),
+            )]
+            .into(),
+        );
+        let report = build_report(
+            &args(&["--teams"]),
+            "https://api.github.com/graphql",
+            &example(),
+            vec![with_teams],
+            Vec::new(),
+        );
+
+        let teams: Vec<(&str, &str)> = report.repositories[0]
+            .teams
+            .iter()
+            .map(|(team, permission)| (team.as_str(), permission.as_str()))
+            .collect();
+        assert_eq!(teams, [("admins", "admin"), ("maintainers", "maintain")]);
+        assert!(report.repositories[1].teams.is_empty());
+        assert_eq!(report.totals.repositories_without_teams, Some(1));
+    }
+
+    #[test]
+    fn without_the_flag_no_team_count_is_claimed() {
+        let report = report(vec![snapshot("acme", vec![repo_node("one")])]);
+        assert_eq!(report.totals.repositories_without_teams, None);
+        let yaml = yaml::to_string(&report).expect("serializes");
+        assert!(!yaml.contains("teams"));
     }
 
     #[test]
@@ -645,6 +810,8 @@ mod tests {
         // False flags and empty lists are absent, not null.
         assert!(repo.get("template").is_none());
         assert!(repo.get("topics").is_none());
+        assert!(repo.get("teams").is_none());
+        assert!(parsed["source"].get("organization").is_none());
         assert!(
             parsed
                 .get("organizations_without_repository_data")
