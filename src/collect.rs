@@ -1,3 +1,5 @@
+use std::collections::{BTreeMap, HashMap};
+
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use serde_json::json;
@@ -58,6 +60,36 @@ query(
         repositoryTopics(first: 20) @include(if: $withTopics) {
           nodes { topic { name } }
         }
+      }
+    }
+  }
+}
+"#;
+
+const ORG_TEAMS: &str = r#"
+query($login: String!, $cursor: String, $batchSize: Int!) {
+  organization(login: $login) {
+    teams(first: $batchSize, after: $cursor, orderBy: {field: NAME, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        slug
+        repositories(first: $batchSize) {
+          pageInfo { hasNextPage endCursor }
+          edges { permission node { name } }
+        }
+      }
+    }
+  }
+}
+"#;
+
+const TEAM_REPOS: &str = r#"
+query($login: String!, $slug: String!, $cursor: String, $batchSize: Int!) {
+  organization(login: $login) {
+    team(slug: $slug) {
+      repositories(first: $batchSize, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        edges { permission node { name } }
       }
     }
   }
@@ -167,12 +199,19 @@ impl Filter {
 pub struct OrgSnapshot {
     pub login: String,
     pub repositories: Vec<RepoNode>,
+    /// Team access per repository; `None` when teams were not requested.
+    pub teams: Option<TeamAccess>,
 }
+
+/// Lowercased repository name -> team slug -> permission (`admin`,
+/// `maintain`, `write`, `triage` or `read`).
+pub type TeamAccess = HashMap<String, BTreeMap<String, String>>;
 
 pub struct Collector<'a> {
     client: &'a GithubClient,
     filter: Filter,
     with_topics: bool,
+    with_teams: bool,
     batch_size: u32,
 }
 
@@ -181,12 +220,14 @@ impl<'a> Collector<'a> {
         client: &'a GithubClient,
         filter: Filter,
         with_topics: bool,
+        with_teams: bool,
         batch_size: u32,
     ) -> Self {
         Self {
             client,
             filter,
             with_topics,
+            with_teams,
             batch_size: batch_size.clamp(1, 100),
         }
     }
@@ -288,10 +329,103 @@ impl<'a> Collector<'a> {
             }
         }
 
+        // Teams failing fails the organization: a snapshot without them would
+        // make every repository look as if no team had access to it.
+        let teams = if self.with_teams {
+            Some(self.org_team_access(login).await?)
+        } else {
+            None
+        };
+
         Ok(OrgSnapshot {
             login: login.to_string(),
             repositories: out,
+            teams,
         })
+    }
+
+    /// Which teams reach which repositories in one organization.
+    ///
+    /// GraphQL has no teams field on a repository, so this walks the
+    /// organization's teams and inverts each one's repository list. The first
+    /// page of every team's repositories rides along with the team listing; a
+    /// team with more than one page is followed up on its own.
+    async fn org_team_access(&self, login: &str) -> Result<TeamAccess> {
+        let mut access = TeamAccess::new();
+        let mut cursor: Option<String> = None;
+
+        loop {
+            let data: OrgTeamsData = self
+                .client
+                .query(
+                    ORG_TEAMS,
+                    json!({ "login": login, "cursor": cursor, "batchSize": self.batch_size }),
+                )
+                .await
+                .with_context(|| format!("listing teams of `{login}`"))?;
+
+            let org = data.organization.with_context(|| {
+                format!("no organization named `{login}` is visible to this token")
+            })?;
+
+            for team in org.teams.nodes.into_iter().flatten() {
+                let mut page = team.repositories.page_info;
+                record_team_repos(&mut access, &team.slug, team.repositories.edges);
+
+                while page.has_next_page && page.end_cursor.is_some() {
+                    let data: TeamReposData = self
+                        .client
+                        .query(
+                            TEAM_REPOS,
+                            json!({
+                                "login": login,
+                                "slug": team.slug,
+                                "cursor": page.end_cursor,
+                                "batchSize": self.batch_size,
+                            }),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("listing repositories of team `{login}/{}`", team.slug)
+                        })?;
+                    let Some(repositories) = data
+                        .organization
+                        .and_then(|org| org.team)
+                        .map(|team| team.repositories)
+                    else {
+                        break;
+                    };
+                    page = repositories.page_info;
+                    record_team_repos(&mut access, &team.slug, repositories.edges);
+                }
+            }
+
+            if !org.teams.page_info.has_next_page {
+                break;
+            }
+            cursor = org.teams.page_info.end_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+
+        Ok(access)
+    }
+}
+
+/// File one team's repositories under each repository's name. An edge whose
+/// repository the token cannot read has no name to file it under.
+fn record_team_repos(access: &mut TeamAccess, team: &str, edges: Vec<Option<TeamRepoEdge>>) {
+    for edge in edges.into_iter().flatten() {
+        let Some(repo) = edge.node else { continue };
+        let permission = edge
+            .permission
+            .map(|p| p.to_lowercase())
+            .unwrap_or_else(|| "unknown".to_string());
+        access
+            .entry(repo.name.to_lowercase())
+            .or_default()
+            .insert(team.to_string(), permission);
     }
 }
 
@@ -379,6 +513,43 @@ mod tests {
         sparse.is_fork = None;
         // Unknown visibility is kept; a null `isArchived` reads as not archived.
         assert!(default.keep(&sparse));
+    }
+
+    fn edge(repo: Option<&str>, permission: Option<&str>) -> Option<TeamRepoEdge> {
+        Some(TeamRepoEdge {
+            permission: permission.map(str::to_string),
+            node: repo.map(|name| NamedNode { name: name.into() }),
+        })
+    }
+
+    #[test]
+    fn team_repositories_are_inverted_into_per_repository_access() {
+        let mut access = TeamAccess::new();
+        record_team_repos(
+            &mut access,
+            "maintainers",
+            vec![
+                edge(Some("Widget-Kit"), Some("MAINTAIN")),
+                edge(Some("docs"), Some("WRITE")),
+                // A repository the token cannot read, and a dropped edge.
+                edge(None, Some("ADMIN")),
+                None,
+            ],
+        );
+        record_team_repos(
+            &mut access,
+            "admins",
+            vec![edge(Some("widget-kit"), Some("ADMIN"))],
+        );
+
+        // Keyed by lowercased repository name, teams in slug order.
+        let widget: Vec<(&str, &str)> = access["widget-kit"]
+            .iter()
+            .map(|(team, permission)| (team.as_str(), permission.as_str()))
+            .collect();
+        assert_eq!(widget, [("admins", "admin"), ("maintainers", "maintain")]);
+        assert_eq!(access["docs"]["maintainers"], "write");
+        assert_eq!(access.len(), 2);
     }
 
     #[test]
