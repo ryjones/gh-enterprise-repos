@@ -6,3 +6,6 @@
 
 # Report output naming real repositories; kept locally, not tracked.
 /reports
+
+# Bare mirrors made by clone-repos.zsh; kept locally, not tracked.
+/repos/

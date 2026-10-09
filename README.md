@@ -182,6 +182,114 @@ its counts are partial.
 | `-o OUT` | Report to write (default `DRIFT.md` beside the export) |
 | `EXPORT` | The export to read (default: the only `.yaml` in `results/`) |
 
+## Cloning what a report lists
+
+`clone-repos.zsh` bare-clones every public, non-archived repository in a report
+into `repos/<org>/<name>`, over https. The report can be YAML or JSON, and
+several can be given at once: they are merged, and a repository two of them both
+name is cloned once. It needs `git`, `yq` and `jq`, and `repos/` is gitignored.
+
+```sh
+gh-enterprise-repos --enterprise lf-decentralized-trust -d reports
+./clone-repos.zsh reports/lf-decentralized-trust.yaml
+./clone-repos.zsh reports/*.yaml            # several enterprises into one tree
+```
+
+The clones are mirrors meant for counting activity per account over a time
+period, so they are fetched with `--filter=tree:0`: every commit with its
+author, committer and dates, and no file content. That makes `git log` work
+offline and keeps the whole enterprise small; `--full` clones trees and blobs
+too, for anything that needs a diff.
+
+Re-running fetches into the clones that are already there, so an interrupted run
+resumes and a stale mirror catches up. Each clone is made under a `.partial`
+name and renamed when git is done, so a half-clone is never mistaken for a
+finished one. Credential prompts are disabled: a repository that was renamed,
+deleted or made private since the report fails in its own line rather than
+waiting for a password. Failures are summarized at the end and set the exit
+status; the other clones still happen.
+
+A repository named `.github` is cloned as `_github`, since a dotted directory
+hides itself from globs and most tooling.
+
+| Flag | Meaning |
+| --- | --- |
+| `-d DIR` | Where the clones go (default `repos/` beside the script) |
+| `-j JOBS` | Clones at a time (default: the machine's CPU count) |
+| `--full` | Clone trees and blobs too, not just commit history |
+| `-n` | List what would be cloned, with its destination, and stop |
+| `REPORT` | The reports to read, YAML or JSON; several are merged |
+
+## TAC election hashes
+
+`tac-eligibility.py` turns the mirrors into the `hashes.js` that
+[tac-eligibility-check](https://github.com/LF-Decentralized-Trust/tac-eligibility-check)
+serves, where the page md5s a trimmed, lowercased GitHub ID and looks it up in
+two lists. The two lists come from different places:
+
+- **nominees**, eligible to run: everyone who authored a commit in the window,
+  read from the bare mirrors, with commit addresses resolved to GitHub logins.
+- **voters**, eligible to vote: maintainers, meaning everyone a CLOWarden config
+  puts in a team holding `write`, `maintain` or `admin` on some repository, plus
+  the organization owners. Neither list is a subset of the other.
+
+Four phases, each resumable and each writing its result into `repos/`, so a
+phase can be re-run on its own:
+
+```sh
+./tac-eligibility.py --report reports/lf-decentralized-trust.yaml --since 2025-07-01
+./tac-eligibility.py --phase logins                # resume the API half alone
+```
+
+`repos/` may hold the mirrors of more than one enterprise, so `--report` (YAML
+or JSON, repeatable) keeps the count to the repositories that report names, and
+says how many of them are not cloned yet. Without it every mirror under
+`repos/` counts.
+
+| Phase | Reads | Writes | Network |
+| --- | --- | --- | --- |
+| `authors` | the mirrors | `repos/authors.json` | none |
+| `logins` | `authors.json`, `repos/cache.json` | `repos/logins.json` | GitHub API |
+| `voters` | the CLOWarden configs, the org-members export | `repos/voters.json` | none |
+| `write` | `logins.json`, `voters.json` | `hashes.js` | none |
+
+`authors` reads each mirror with `git log --all --since`, which needs no trees,
+so a `--filter=tree:0` mirror answers it offline.
+
+`logins` asks GitHub who a commit address belongs to, one call per address
+(`repos/{org}/{repo}/commits/{sha}` → `author.login`), and keeps the answer in
+`repos/cache.json` keyed by address alone. The cache is worth keeping across
+enterprises: every address already in it is a call the next run does not make.
+An address no account claims is no contribution as GitHub counts it either, so
+it is left out and listed in `logins.json` under `unresolved`, busiest first; to
+credit one anyway put it in `repos/aliases.json` as `{"email": "login"}`, which
+is never looked up and always wins. `--retry-unresolved` asks again about the
+ones that came back empty, and `--offline` resolves from the cache alone.
+
+`voters` reads the CLOWarden configs mirrored by
+[gh-org-members](https://github.com/ryjones/gh-org-members)'
+`mirror-clowarden.zsh` for which teams hold write or better, and that repo's
+`results/<enterprise>.gh.yaml` export for who is in those teams and who owns
+each organization. `voters.json` records which of the three — the config, live
+membership, ownership — put each person on the list, so a surprise can be traced
+back.
+
+`write` renders both arrays into `hashes.js` and prints how many hashes each
+list gained and lost against the file that was there. It commits nothing, and
+the logins behind the hashes stay in `repos/`, which is gitignored.
+
+| Flag | Meaning |
+| --- | --- |
+| `--phase P` | Run only this phase; repeatable |
+| `--report FILE` | Count only the repositories this report names; repeatable |
+| `--since D` / `--until D` | The activity window (default: since 2025-07-01) |
+| `--coauthors` | Credit `Co-authored-by` trailers as activity too |
+| `--repos DIR` | The mirrors, and where the intermediate files go |
+| `--people FILE` | gh-org-members export (default: `../gh-org-members/results/lf-decentralized-trust.gh.yaml`) |
+| `--clowarden DIR` | gh-org-members' config mirror (default: `../gh-org-members/mirror`) |
+| `--out FILE` | The `hashes.js` to write |
+| `--jobs N` / `--api-jobs N` | Mirrors read at a time; API calls at a time |
+
 ## Whose view a listing is
 
 An organization the token cannot see is not an error. `enterprise.organizations`
