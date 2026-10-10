@@ -1,3 +1,5 @@
+See [github-audit-tools](https://github.com/ryjones/github-audit-tools) which replaces this
+
 # gh-enterprise-repos
 
 Queries a GitHub enterprise over GraphQL and writes one YAML file per
